@@ -4,6 +4,10 @@
 import numpy as np
 import cv2
 from scipy.special import kl_div
+import torch
+import torch.nn.functional as F
+from torchvision import transforms
+from PIL import Image
 
 # DiffSeg:
 #   -> zero-shot (able to identify new classes)
@@ -108,20 +112,134 @@ def kl_divergence(P, Q):
 def iterative_attention_merging(attention_tensor, M=64, threshold=0.1, max_iterations=10):
     """
     """
+# Step 1: Generate anchor points (M x M grid)
+    height, width, _, _ = attention_tensor.shape
+    anchor_points = [(i, j) for i in range(0, height, height//M) for j in range(0, width, width//M)]
+    
+    # Step 2: Create the list of anchor attention maps (La)
+    La = [attention_tensor[i, j, :, :] for (i, j) in anchor_points]
+    
+    # Step 3: Initialize proposals list (Lp) with anchor attention maps
+    Lp = La.copy()
 
-# Example usage
-# if __name__ == "__main__":
-#     # Simulated attention tensors with random values for demonstration purposes
-#     attention_tensors = [
-#         np.random.rand(64, 64, 64, 64),
-#         np.random.rand(32, 32, 32, 32),
-#         np.random.rand(16, 16, 16, 16),
-#         np.random.rand(8, 8, 8, 8)
-#     ]
-#     resolutions = [(64, 64), (32, 32), (16, 16), (8, 8)]
+    # Step 4: Iteratively merge attention maps based on KL divergence
+    for iteration in range(max_iterations):
+        new_proposals = []
+        
+        # Step 4.1: Compute pairwise KL divergence and merge based on threshold
+        for i in range(len(Lp)):
+            merged_map = Lp[i]
+            for j in range(len(Lp)):
+                if i != j:
+                    kl_distance = kl_divergence(Lp[i], Lp[j])
+                    if kl_distance < threshold:
+                        merged_map = np.maximum(merged_map, Lp[j])  # Merge by taking max activations
+            new_proposals.append(merged_map)
+        
+        # Step 4.2: Reduce the number of proposals
+        Lp = new_proposals
+        
+        # Step 4.3: Optionally apply NMS (Non-Maximum Suppression) to remove duplicates
+        Lp = apply_nms(Lp, threshold)
+    
+    return Lp
 
-#     # Aggregate attention tensors
-#     aggregated_attention = aggregate_attention(attention_tensors, resolutions)
+#############################################
+########## NON-MAXIMUM SUPPRESSION ##########
+#############################################
 
-#     # Display the shape of the final aggregated tensor
-#     print("Aggregated Attention Shape:", aggregated_attention.shape)
+# Function for Non-Maximum Suppression (NMS)
+def apply_nms(proposals, threshold):
+    """
+    Apply Non-Maximum Suppression to remove redundant or overlapping proposals.
+    
+    Parameters:
+    - proposals: The list of proposals to apply NMS.
+    - threshold: The threshold for suppression.
+    
+    Returns:
+    - proposals: The filtered list of proposals after NMS.
+    """
+    filtered_proposals = []
+    for i, proposal in enumerate(proposals):
+        # Check if this proposal overlaps significantly with existing proposals
+        add_proposal = True
+        for existing_proposal in filtered_proposals:
+            overlap = np.sum(np.minimum(proposal, existing_proposal))
+            if overlap > threshold:
+                add_proposal = False
+                break
+        if add_proposal:
+            filtered_proposals.append(proposal)
+    
+    return filtered_proposals
+
+def bilinear_upsample(Lp, target_height, target_width):
+    """
+    Upsample the list of proposals Lp to the target resolution (target_height x target_width)
+    using bilinear interpolation.
+    
+    Args:
+        Lp (torch.Tensor): The tensor containing object proposals, shape (Np, 64, 64).
+        target_height (int): The target height for the upsampling (e.g., 512).
+        target_width (int): The target width for the upsampling (e.g., 512).
+        
+    Returns:
+        torch.Tensor: Upsampled proposals, shape (Np, target_height, target_width).
+    """
+    # Assuming Lp is of shape (Np, 64, 64)
+    Np = Lp.shape[0]
+    Lp = Lp.unsqueeze(0)  # Add a batch dimension: (1, Np, 64, 64)
+    
+    upsampled_Lp = F.interpolate(Lp, size=(target_height, target_width), mode='bilinear', align_corners=False)
+    
+    return upsampled_Lp.squeeze(0)  # Remove batch dimension to return (Np, target_height, target_width)
+
+def non_maximum_suppression(upsampled_Lp):
+    """
+    Apply non-maximum suppression to the upsampled proposals and generate the final segmentation mask.
+    
+    Args:
+        upsampled_Lp (torch.Tensor): The tensor of upsampled proposals, shape (Np, 512, 512).
+        
+    Returns:
+        torch.Tensor: The final segmentation mask S, shape (512, 512), containing the proposal index 
+                      with the highest probability at each spatial location.
+    """
+    # Convert upsampled_Lp to numpy for easier manipulation
+    upsampled_Lp_np = upsampled_Lp.cpu().numpy()  # Convert to numpy array (Np, 512, 512)
+    
+    # Create a mask for the final segmentation result
+    S = np.argmax(upsampled_Lp_np, axis=0)  # (512, 512), each pixel gets the index of the highest probability map
+
+    return torch.tensor(S, dtype=torch.long).to(upsampled_Lp.device)  # Convert back to tensor and return
+
+def generate_segmentation_mask(Lp, target_height=512, target_width=512):
+    """
+    Generate the segmentation mask from object proposals using bilinear upsampling and non-maximum suppression.
+    
+    Args:
+        Lp (torch.Tensor): The tensor of object proposals, shape (Np, 64, 64).
+        target_height (int): The target height for the upsampling (default 512).
+        target_width (int): The target width for the upsampling (default 512).
+        
+    Returns:
+        torch.Tensor: The final segmentation mask, shape (512, 512).
+    """
+    # Step 1: Bilinear upsample proposals to the target resolution
+    upsampled_Lp = bilinear_upsample(Lp, target_height, target_width)
+    
+    # Step 2: Apply non-maximum suppression to generate the final segmentation mask
+    segmentation_mask = non_maximum_suppression(upsampled_Lp)
+    
+    return segmentation_mask
+
+# Example tensor of object proposals of shape (Np, 64, 64)
+Np = 10
+Lp = torch.randn(Np, 64, 64)  # Random tensor representing proposals
+
+# Generate segmentation mask
+segmentation_mask = generate_segmentation_mask(Lp)
+
+# Output the segmentation mask shape
+print(segmentation_mask.shape)  # Should print torch.Size([512, 512])
